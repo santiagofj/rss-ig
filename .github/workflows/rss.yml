@@ -48,12 +48,18 @@ jobs:
           python3 rss_ig.py --validar
           if ! git diff --quiet -- feed.xml; then
             git add -- feed.xml
+            if [ -d media ]; then
+              git add -- media
+            fi
             git -c user.name='github-actions[bot]' \
                 -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
                 commit -m 'Actualizar feed de Instagram'
             git push
           fi
           install -D feed.xml "$RUNNER_TEMP/rss-publico/feed.xml"
+          if [ -d media ]; then
+            cp -R -- media "$RUNNER_TEMP/rss-publico/"
+          fi
 
       - uses: actions/upload-pages-artifact@v4
         if: inputs.modo != 'probar'

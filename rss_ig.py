@@ -1,7 +1,7 @@
 """Actualiza el RSS a partir del embed público de Instagram."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from html import escape
@@ -10,7 +10,8 @@ from pathlib import Path
 import re
 import sys
 from tempfile import NamedTemporaryFile
-from urllib.request import urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, build_opener, urlopen
 import xml.etree.ElementTree as ET
 
 
@@ -24,6 +25,13 @@ CHANNEL_DESCRIPTION = f"Publicaciones recientes de @{ACCOUNT}."
 SHORTCODE = re.compile(r"[A-Za-z0-9_-]+")
 SERVER_DATA = re.compile(r"new ServerJS\(\)\);s\.handle\(\s*(?=\{)")
 MAX_EMBED_BYTES = 3_000_000
+MAX_IMAGE_BYTES = 1_000_000
+IMAGE_TYPES = {"jpg": "image/jpeg", "webp": "image/webp", "png": "image/png"}
+MEDIA_DIRECTORY = "media"
+MEDIA_URL = "https://santiagofj.github.io/rss-ig/media/"
+MEDIA_NAMESPACE = "http://search.yahoo.com/mrss/"
+MEDIA_CONTENT = f"{{{MEDIA_NAMESPACE}}}content"
+ET.register_namespace("media", MEDIA_NAMESPACE)
 
 
 @dataclass(frozen=True)
@@ -32,10 +40,28 @@ class Post:
     published: datetime
     title: str
     description: str
+    cover_extension: str | None = None
 
     @property
     def link(self) -> str:
         return f"{POST_URL}{self.code}/"
+
+    @property
+    def cover_filename(self) -> str | None:
+        if self.cover_extension is None:
+            return None
+        return f"{self.code}.{self.cover_extension}"
+
+
+@dataclass(frozen=True)
+class RecentPost:
+    post: Post
+    cover_source: str | None
+
+
+class NoImageRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def fetch_embed() -> str:
@@ -46,6 +72,46 @@ def fetch_embed() -> str:
     if len(body) > MAX_EMBED_BYTES:
         raise ValueError("El embed excede el límite de tamaño")
     return body.decode("utf-8")
+
+
+def cover_source(media: dict) -> str | None:
+    children = media.get("edge_sidecar_to_children", {}).get("edges", [])
+    if children:
+        media = children[0]["node"]
+    resources = media.get("display_resources", [])
+    if resources:
+        return min(resources, key=lambda image: abs(image["config_width"] - 640))["src"]
+    return media.get("display_url")
+
+
+def image_extension(content: bytes) -> str | None:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "webp"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    return None
+
+
+def fetch_cover(url: str) -> tuple[str, bytes]:
+    source = urlsplit(url)
+    host = source.hostname or ""
+    if (
+        source.scheme != "https"
+        or not host.endswith((".cdninstagram.com", ".fbcdn.net"))
+        or source.netloc != host
+    ):
+        raise ValueError("La imagen no viene de un CDN público de Instagram")
+    with build_opener(NoImageRedirects()).open(url, timeout=15) as response:
+        if response.status != 200:
+            raise ValueError("Instagram devolvió un estado inesperado para la imagen")
+        mime_type = response.headers.get_content_type()
+        content = response.read(MAX_IMAGE_BYTES + 1)
+    extension = image_extension(content)
+    if extension is None or len(content) > MAX_IMAGE_BYTES or IMAGE_TYPES[extension] != mime_type:
+        raise ValueError("La imagen tiene un tamaño o formato inesperado")
+    return extension, content
 
 
 def excerpt(words: list[str], limit: int) -> str:
@@ -75,7 +141,7 @@ def post_from_media(media: dict) -> Post:
     return Post(code, datetime.fromtimestamp(timestamp, UTC), title, description)
 
 
-def parse_embed(page: str) -> dict[str, Post]:
+def parse_embed(page: str) -> dict[str, RecentPost]:
     marker = SERVER_DATA.search(page)
     if marker is None:
         raise ValueError("El HTML no contiene los datos esperados del embed")
@@ -95,9 +161,14 @@ def parse_embed(page: str) -> dict[str, Post]:
 
     posts = {}
     for entry in media:
-        post = post_from_media(entry["shortcode_media"])
-        posts.setdefault(post.code, post)
+        node = entry["shortcode_media"]
+        post = post_from_media(node)
+        posts.setdefault(post.code, RecentPost(post, cover_source(node)))
     return posts
+
+
+def cover_html(url: str) -> str:
+    return f'<p><img src="{url}" alt="Imagen de la publicación"></p>'
 
 
 def parse_feed(content: bytes) -> dict[str, Post]:
@@ -135,7 +206,24 @@ def parse_feed(content: bytes) -> dict[str, Post]:
         published = parsedate_to_datetime(item.findtext("pubDate", ""))
         if published.tzinfo is None or (previous_date is not None and published > previous_date):
             raise ValueError("El RSS contiene fechas sin zona horaria o fuera de orden")
-        posts[code] = Post(code, published, title, description)
+
+        extension = None
+        cover = item.find(MEDIA_CONTENT)
+        if cover is not None:
+            url = cover.get("url", "")
+            extension = url.rsplit(".", 1)[-1]
+            if (
+                extension not in IMAGE_TYPES
+                or url != f"{MEDIA_URL}{code}.{extension}"
+                or cover.get("type") != IMAGE_TYPES[extension]
+                or cover.get("medium") != "image"
+                or not description.startswith(cover_html(url))
+            ):
+                raise ValueError("El RSS contiene una referencia de imagen inválida")
+            description = description.removeprefix(cover_html(url))
+            if not description:
+                raise ValueError("Falta la descripción de una publicación")
+        posts[code] = Post(code, published, title, description, extension)
         previous_date = published
     if not posts:
         raise ValueError("El RSS no contiene publicaciones")
@@ -153,7 +241,14 @@ def render_feed(posts: dict[str, Post]) -> bytes:
     for post in sorted(posts.values(), key=lambda post: (post.published, post.code), reverse=True):
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = post.title
-        ET.SubElement(item, "description").text = post.description
+        description = post.description
+        if post.cover_extension:
+            url = f"{MEDIA_URL}{post.cover_filename}"
+            description = cover_html(url) + description
+            ET.SubElement(
+                item, MEDIA_CONTENT, url=url, type=IMAGE_TYPES[post.cover_extension], medium="image"
+            )
+        ET.SubElement(item, "description").text = description
         ET.SubElement(item, "link").text = post.link
         ET.SubElement(item, "guid", isPermaLink="true").text = post.link
         ET.SubElement(item, "pubDate").text = format_datetime(post.published.astimezone(UTC), usegmt=True)
@@ -161,12 +256,15 @@ def render_feed(posts: dict[str, Post]) -> bytes:
     return ET.tostring(rss, encoding="utf-8", xml_declaration=True) + b"\n"
 
 
-def replace_feed(path: Path, posts: dict[str, Post]) -> None:
+def validated_feed(posts: dict[str, Post]) -> bytes:
     content = render_feed(posts)
     if parse_feed(content) != posts:
         raise ValueError("El RSS generado difiere de las publicaciones que debe contener")
+    return content
 
-    # El temporal reside junto al RSS para que el reemplazo sea atómico.
+
+def replace_file(path: Path, content: bytes) -> None:
+    # El temporal reside junto al destino para que el reemplazo sea atómico.
     with NamedTemporaryFile(dir=path.parent, prefix=".feed-", delete=False) as output:
         candidate = Path(output.name)
     try:
@@ -176,34 +274,68 @@ def replace_feed(path: Path, posts: dict[str, Post]) -> None:
         candidate.unlink(missing_ok=True)
 
 
-def update_feed(path: Path, recent: dict[str, Post]) -> tuple[int, int]:
+def merge_posts(
+    previous: dict[str, Post], recent: dict[str, RecentPost]
+) -> tuple[dict[str, Post], dict[str, bytes]]:
+    # Conservar el texto y la fecha ya publicados cuando la ventana se superpone.
+    merged = {code: item.post for code, item in recent.items()} | previous
+    covers = {}
+    for code, item in recent.items():
+        post = merged[code]
+        if post.cover_extension is None and item.cover_source:
+            extension, data = fetch_cover(item.cover_source)
+            post = replace(post, cover_extension=extension)
+            merged[code] = post
+            covers[f"{code}.{extension}"] = data
+    return merged, covers
+
+
+def validate_cover_files(path: Path, posts: dict[str, Post]) -> None:
+    for post in posts.values():
+        filename = post.cover_filename
+        if filename:
+            picture = path.parent / MEDIA_DIRECTORY / filename
+            if not picture.is_file():
+                raise ValueError(f"Falta la imagen guardada de {post.code}")
+
+
+def update_feed(path: Path, recent: dict[str, RecentPost]) -> tuple[int, int, int]:
     try:
         previous = parse_feed(path.read_bytes())
     except FileNotFoundError:
         previous = {}
-    # Conservar los datos que ya se entregaron cuando la ventana se superpone.
-    merged = recent | previous
+    validate_cover_files(path, previous)
+    merged, covers = merge_posts(previous, recent)
     added = len(merged) - len(previous)
-    if added:
-        replace_feed(path, merged)
-    return added, len(merged)
+    if merged != previous:
+        content = validated_feed(merged)
+        if covers:
+            directory = path.parent / MEDIA_DIRECTORY
+            directory.mkdir(exist_ok=True)
+            for name, data in covers.items():
+                replace_file(directory / name, data)
+        replace_file(path, content)
+    return added, len(merged), len(covers)
 
 
 def run(path: Path, *, probe: bool = False, validate: bool = False) -> None:
     if validate:
         posts = parse_feed(path.read_bytes())
-        print(f"RSS válido con {len(posts)} publicaciones.")
+        validate_cover_files(path, posts)
+        pictures = sum(post.cover_extension is not None for post in posts.values())
+        print(f"RSS válido con {len(posts)} publicaciones y {pictures} imágenes.")
         return
 
     recent = parse_embed(fetch_embed())
     print(f"Instagram devolvió {len(recent)} publicaciones válidas sin sesión.")
     if probe:
-        if parse_feed(render_feed(recent)) != recent:
-            raise ValueError("El embed no produjo un RSS válido")
+        posts, covers = merge_posts({}, recent)
+        validated_feed(posts)
+        print(f"Instagram devolvió {len(covers)} imágenes verificadas.")
         return
 
-    added, total = update_feed(path, recent)
-    print(f"{added} publicaciones nuevas y {total} en el RSS.")
+    added, total, pictures = update_feed(path, recent)
+    print(f"{added} publicaciones nuevas, {total} en el RSS y {pictures} imágenes agregadas.")
 
 
 def main() -> int:
