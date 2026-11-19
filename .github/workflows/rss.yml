@@ -1,0 +1,74 @@
+name: RSS de Instagram
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: Operación
+        type: choice
+        default: probar
+        options:
+          - probar
+          - actualizar
+          - publicar_guardado
+
+concurrency:
+  group: rss-instagram
+  cancel-in-progress: false
+
+env:
+  MODO: ${{ inputs.modo || 'actualizar' }}
+
+jobs:
+  generar:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: ${{ inputs.modo != 'probar' }}
+
+      - name: Probar el embed sin modificar el feed
+        if: inputs.modo == 'probar'
+        run: python3 rss_ig.py --probar
+
+      - name: Actualizar el RSS
+        if: env.MODO == 'actualizar'
+        run: python3 rss_ig.py
+
+      - name: Validar y guardar el RSS
+        if: inputs.modo != 'probar'
+        run: |
+          python3 rss_ig.py --validar
+          if ! git diff --quiet -- feed.xml; then
+            git add -- feed.xml
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m 'Actualizar feed de Instagram'
+            git push
+          fi
+          install -D feed.xml "$RUNNER_TEMP/rss-publico/feed.xml"
+
+      - uses: actions/upload-pages-artifact@v4
+        if: inputs.modo != 'probar'
+        with:
+          path: ${{ runner.temp }}/rss-publico
+
+  publicar:
+    if: inputs.modo != 'probar'
+    needs: generar
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4
