@@ -22,6 +22,7 @@ POST_URL = "https://www.instagram.com/p/"
 FEED_PATH = Path(__file__).with_name("feed.xml")
 CHANNEL_TITLE = f"@{ACCOUNT} en Instagram"
 CHANNEL_DESCRIPTION = f"Publicaciones recientes de @{ACCOUNT}."
+NO_CAPTION = "Sin texto disponible en Instagram."
 SHORTCODE = re.compile(r"[A-Za-z0-9_-]+")
 SERVER_DATA = re.compile(r"new ServerJS\(\)\);s\.handle\(\s*(?=\{)")
 MAX_EMBED_BYTES = 3_000_000
@@ -114,10 +115,6 @@ def fetch_cover(url: str) -> tuple[str, bytes]:
     return extension, content
 
 
-def excerpt(words: list[str], limit: int) -> str:
-    return " ".join(words[:limit]) + ("…" if len(words) > limit else "")
-
-
 def post_from_media(media: dict) -> Post:
     code = media["shortcode"]
     timestamp = media["taken_at_timestamp"]
@@ -129,15 +126,17 @@ def post_from_media(media: dict) -> Post:
     edges = media["edge_media_to_caption"]["edges"]
     if not isinstance(edges, list):
         raise ValueError("El embed contiene un formato de texto inesperado")
-    words = " ".join(edge["node"]["text"] for edge in edges).split()
-    if words:
-        title = excerpt(words, 8)
+    caption = "\n".join(edge["node"]["text"] for edge in edges).strip()
+    if caption:
+        words = caption.split()
+        title = " ".join(words[:8]) + ("…" if len(words) > 8 else "")
         # La descripción RSS se interpreta como HTML en lectores de feeds.
-        description = escape(excerpt(words, 20), quote=False)
+        caption = caption.replace("\r\n", "\n").replace("\r", "\n")
+        description = escape(caption, quote=False).replace("\n", "<br>")
     else:
         kind = "Carrusel" if media["__typename"] == "GraphSidecar" else "Publicación"
         title = f"{kind} de @{ACCOUNT}"
-        description = "Sin texto disponible en Instagram."
+        description = NO_CAPTION
     return Post(code, datetime.fromtimestamp(timestamp, UTC), title, description)
 
 
@@ -277,16 +276,18 @@ def replace_file(path: Path, content: bytes) -> None:
 def merge_posts(
     previous: dict[str, Post], recent: dict[str, RecentPost]
 ) -> tuple[dict[str, Post], dict[str, bytes]]:
-    # Conservar el texto y la fecha ya publicados cuando la ventana se superpone.
+    # Conservar la identidad y fecha originales de las entradas ya publicadas.
     merged = {code: item.post for code, item in recent.items()} | previous
     covers = {}
     for code, item in recent.items():
         post = merged[code]
+        if item.post.description != NO_CAPTION:
+            post = replace(post, description=item.post.description)
         if post.cover_extension is None and item.cover_source:
             extension, data = fetch_cover(item.cover_source)
             post = replace(post, cover_extension=extension)
-            merged[code] = post
             covers[f"{code}.{extension}"] = data
+        merged[code] = post
     return merged, covers
 
 

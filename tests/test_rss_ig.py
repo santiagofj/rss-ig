@@ -61,22 +61,40 @@ class FeedTest(unittest.TestCase):
         self.assertEqual(posts["Abc-1"], first["Abc-1"].post)
         self.assertEqual(posts["Xyz_2"], first["Xyz_2"].post)
 
-    def test_rss_fields_and_caption_limit(self):
-        caption = "<evento> & música 🎶 " + " ".join(f"palabra{i}" for i in range(25))
+    def test_rss_fields_and_full_caption(self):
+        caption = "<evento> & música 🎶\n\n" + " ".join(f"palabra{i}" for i in range(25))
         posts = ig.parse_embed(embed(
             media("Yep", 1795082279, caption),
             media("Nah", 1795077207),
         ))
         ig.update_feed(self.path, posts)
         parsed = ig.parse_feed(self.path.read_bytes())
-        self.assertEqual(parsed["Yep"].description.split()[0], "&lt;evento&gt;")
-        self.assertEqual(unescape(parsed["Yep"].description).split(), caption.split()[:19] + ["palabra15…"])
+        self.assertTrue(parsed["Yep"].description.startswith("&lt;evento&gt; &amp;"))
+        self.assertEqual(unescape(parsed["Yep"].description.replace("<br>", "\n")), caption)
         self.assertEqual(parsed["Yep"].published.tzinfo, UTC)
         self.assertEqual(parsed["Yep"].published.timestamp(), 1795082279)
         self.assertEqual(parsed["Nah"].description, "Sin texto disponible en Instagram.")
         item = ET.parse(self.path).find("./channel/item")
         self.assertEqual(item.findtext("link"), "https://www.instagram.com/p/Yep/")
         self.assertEqual(item.findtext("guid"), item.findtext("link"))
+
+    def test_backfills_previous_caption_without_changing_identity(self):
+        first = ig.parse_embed(embed(media("Old", 1795082279, "Texto anterior…")))
+        ig.update_feed(self.path, first)
+        original = ig.parse_feed(self.path.read_bytes())["Old"]
+
+        caption = "Primera línea\r\n\r\nSegunda línea\nTercera línea y cierre"
+        current = ig.parse_embed(embed(media("Old", 1795082279, caption)))
+        self.assertEqual(ig.update_feed(self.path, current), (0, 1, 0))
+        item = ET.parse(self.path).find("./channel/item")
+        self.assertEqual(item.findtext("guid"), original.link)
+        self.assertEqual(item.findtext("title"), original.title)
+        self.assertEqual(item.findtext("description"), "Primera línea<br><br>Segunda línea<br>Tercera línea y cierre")
+
+        updated = self.path.read_bytes()
+        without_caption = ig.parse_embed(embed(media("Old", 1795082279)))
+        ig.update_feed(self.path, without_caption)
+        self.assertEqual(self.path.read_bytes(), updated)
 
     def test_probe_leaves_the_feed_untouched(self):
         with patch.object(ig, "fetch_embed", return_value=embed(media("Yep", 1795082279))):

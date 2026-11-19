@@ -19,7 +19,7 @@ El [embed público del perfil](https://www.instagram.com/laagendaculturaldefacu/
 
 ## Requisitos
 
-- **REQ-01** Generar un RSS 2.0 en UTF-8 con fecha original, enlace permanente, identificador estable y extracto de hasta 20 palabras cuando haya texto. Indicar explícitamente cuando el texto no esté disponible.
+- **REQ-01** Generar un RSS 2.0 en UTF-8 con fecha original, enlace permanente, identificador estable y descripción completa con los saltos de línea del original. Indicar cuando el texto no esté disponible. Completar las descripciones de las entradas ya publicadas cuyo texto siga disponible en el embed.
 - **REQ-02** Incorporar cada publicación una sola vez y conservar las entradas previas cuando salgan de la ventana de publicaciones recientes.
 - **REQ-03** Conservar el último RSS válido ante errores de descarga, redirecciones a inicio de sesión, respuestas vacías o formatos inesperados.
 - **REQ-04** Consultar cada dos horas desde GitHub Actions y publicar el RSS en GitHub Pages desde un repositorio público independiente. La lectura y la consulta de Instagram deben funcionar sin cuenta de Instagram y sin servicios pagos.
@@ -34,6 +34,7 @@ El [embed público del perfil](https://www.instagram.com/laagendaculturaldefacu/
 | DEC-03 | Validar el candidato completo antes de reemplazar el archivo y serializar las actualizaciones. Guardar los cambios válidos en Git y desplegar explícitamente con GitHub Actions. | Git permite recuperar el feed. Un push con el token del workflow por sí solo no dispara un build de Pages. |
 | DEC-04 | Usar un runner estándar y programar al minuto 33 de cada segunda hora UTC, de modo que la primera ejecución pueda verificarse durante la entrega. Habilitar una ejecución manual para probar y recuperar despliegues. | Pages y los runners estándar son gratuitos en repositorios públicos. GitHub puede demorar o saltar ejecuciones y desactivar la programación tras 60 días de inactividad del repositorio. |
 | DEC-05 | Guardar una vista previa de alrededor de 640 píxeles por shortcode en `media/` y desplegarla junto al RSS. Referenciar la misma URL en la descripción HTML y en Media RSS. | Las URLs del CDN caducan. La imagen guardada sigue disponible al salir de la ventana del embed. Solo se guardan imágenes de un CDN admitido cuya firma, MIME y tamaño coincidan con el formato esperado. |
+| DEC-06 | Usar el texto completo de Instagram en la descripción del RSS y convertir sus saltos de línea a HTML. Actualizar la descripción cuando el embed entregue texto y conservar la anterior si falta. | Las entradas existentes pueden pasar de extracto a descripción completa sin cambiar su GUID. |
 
 Fuentes técnicas de las decisiones. [RSS 2.0](https://www.rssboard.org/rss-specification), [Media RSS](https://www.rssboard.org/media-rss), [publicación con Actions](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site), [costos de Actions](https://docs.github.com/en/actions/concepts/billing-and-usage), [programación de workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
@@ -41,18 +42,20 @@ Fuentes técnicas de las decisiones. [RSS 2.0](https://www.rssboard.org/rss-spec
 
 | ID | Requisito | Verificación y evidencia |
 | --- | --- | --- |
-| AC-01 | REQ-01 | **Verificado localmente.** Un segundo analizador XML comprobó la estructura del canal, las fechas de la fuente, el orden descendente, los seis GUID y enlaces únicos, los tres extractos y los tres avisos de falta de texto. |
+| AC-01 | REQ-01 | La validación inicial comprobó la estructura del canal, las fechas de la fuente, el orden descendente y seis GUID y enlaces únicos. Las pruebas del generador cubren las descripciones completas, los saltos de línea, la actualización de las entradas existentes y los avisos de falta de texto. |
 | AC-02 | REQ-02 | **Verificado con pruebas locales.** Una respuesta repetida no cambió el archivo. Una ventana superpuesta conservó las entradas anteriores y añadió el shortcode nuevo una sola vez. |
 | AC-03 | REQ-03 | **Verificado con pruebas locales.** Fallos de red, HTTP 429, inicio de sesión, una lista vacía, cambios de esquema y XML inválido dejaron intactos los bytes del RSS anterior. |
 | AC-04 | REQ-04 | La [prueba manual en el runner estándar](https://github.com/santiagofj/rss-ig/actions/runs/44565856162) obtuvo seis publicaciones válidas sin sesión. El [primer despliegue](https://github.com/santiagofj/rss-ig/actions/runs/44566229771) sirvió un RSS público válido. Sigue pendiente confirmar la primera ejecución programada. |
-| AC-05 | REQ-05 | Las pruebas cubren la primera imagen del carrusel, las URLs no permitidas y la conservación del feed cuando falla la descarga. La prueba local del embed obtuvo seis imágenes. Queda comprobar su descarga desde el runner y sus URLs públicas tras el despliegue. |
+| AC-05 | REQ-05 | **Verificado.** Las pruebas cubren la primera imagen del carrusel, las URLs no permitidas y la conservación del feed cuando falla la descarga. El [despliegue de imágenes](https://github.com/santiagofj/rss-ig/actions/runs/44568291443) completó las seis entradas sin cambiar sus GUID. Las seis URLs del [RSS público](https://santiagofj.github.io/rss-ig/feed.xml) devolvieron HTTP 200, el MIME esperado y los mismos bytes que los archivos guardados. |
 
 ## Publicación y recuperación
 
-Probar primero la descarga anónima desde el runner. Una vez validada, publicar el último feed bueno y habilitar el cron. Si falla un despliegue, reintentar con el XML validado que quedó en Git, sin depender de que hayan aparecido publicaciones nuevas. Registrar el estado de la consulta y los recuentos de entradas para identificar fallos o duplicados.
+Probar primero la descarga anónima desde el runner. Una vez validada, publicar el último feed bueno y habilitar el cron. Si falla un despliegue, usar el modo manual `publicar_guardado` para recuperar el XML y las imágenes validadas que quedaron en Git. Registrar el estado de la consulta y los recuentos de entradas para identificar fallos o duplicados.
 
 ## Aprobación
 
 El usuario aprobó el 19 de noviembre de 2026 el generador recurrente, la prueba en GitHub Actions y el despliegue en un repositorio público independiente. La actualización programada se habilita tras verificar el acceso al embed desde el runner.
 
 Ese mismo día aprobó agregar la imagen principal, también a las entradas existentes sin texto. Las imágenes se despliegan junto con el RSS tras validar todas las referencias.
+
+En la revisión del feed, el usuario pidió incluir la descripción completa de cada publicación.
